@@ -1,6 +1,6 @@
-# Timeless Prototype
+# Openrouterhello
 
-Timeless Prototype is a Python CLI demo for multimodal chat with OpenRouter using the OpenAI SDK.
+Openrouterhello is a Python CLI demo for multimodal chat with OpenRouter using the OpenAI SDK.
 
 ## Features
 
