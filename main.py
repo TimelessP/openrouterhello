@@ -2,10 +2,12 @@ import os
 import sys
 import base64
 import json
+import mimetypes
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, cast
 
 from dotenv import load_dotenv
@@ -75,6 +77,67 @@ TOOL_FUNCTIONS: dict[str, Any] = {
     "get_current_utc_datetime": get_current_utc_datetime,
     "generate_uuid4": generate_uuid4,
 }
+
+
+def _is_web_or_data_url(value: str) -> bool:
+    return value.startswith(("http://", "https://", "data:"))
+
+
+def _to_data_url(file_path: str, default_mime: str, force_mime: str | None = None) -> str | None:
+    path = Path(file_path).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+
+    if not path.exists() or not path.is_file():
+        print(f"File not found: {file_path}")
+        return None
+
+    mime_type, _ = mimetypes.guess_type(str(path))
+    if force_mime:
+        mime_type = force_mime
+    elif not mime_type:
+        mime_type = default_mime
+
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        print(f"Could not read file: {e}")
+        return None
+
+    size_mb = len(raw) / (1024 * 1024)
+    print(f"Loaded {path.name} ({size_mb:.2f} MB).")
+    encoded = base64.b64encode(raw).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def resolve_image_input(value: str) -> str | None:
+    if _is_web_or_data_url(value):
+        return value
+
+    data_url = _to_data_url(value, default_mime="image/jpeg")
+    if not data_url:
+        return None
+    if not data_url.startswith("data:image/"):
+        print("Warning: file may not be an image based on mime type.")
+    return data_url
+
+
+def resolve_mp4_input(value: str) -> str | None:
+    if _is_web_or_data_url(value):
+        return value
+
+    if Path(value).suffix.lower() != ".mp4":
+        print("Video file path must point to an .mp4 file.")
+        return None
+
+    return _to_data_url(value, default_mime="video/mp4", force_mime="video/mp4")
+
+
+def _media_preview(value: str) -> str:
+    if value.startswith("data:"):
+        header = value.split(",", 1)[0]
+        return f"{header},..."
+    return value if len(value) <= 60 else value[:57] + "..."
 
 
 def record_audio() -> str | None:
@@ -205,14 +268,30 @@ def _respond_with_tools(client: OpenAI, messages: list[dict[str, Any]]) -> str:
     return "I reached the tool-call round limit before producing a final answer."
 
 
-def send(client: OpenAI, pending_text: str | None, pending_audio: str | None):
+def send(
+    client: OpenAI,
+    pending_text: str | None,
+    pending_audio: str | None,
+    pending_image: str | None,
+    pending_video: str | None,
+):
     content: list[dict[str, Any]] = []
     if pending_text:
         content.append({"type": "text", "text": pending_text})
+    if pending_image:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": pending_image},
+        })
     if pending_audio:
         content.append({
             "type": "input_audio",
             "input_audio": {"data": pending_audio, "format": "wav"},
+        })
+    if pending_video:
+        content.append({
+            "type": "video_url",
+            "video_url": {"url": pending_video},
         })
 
     messages: list[dict[str, Any]] = [
@@ -227,7 +306,7 @@ def send(client: OpenAI, pending_text: str | None, pending_audio: str | None):
     ]
 
     # Use simple string for text-only (broader model compatibility)
-    if pending_text and not pending_audio:
+    if pending_text and not pending_audio and not pending_image and not pending_video:
         messages.append({"role": "user", "content": pending_text})
     else:
         messages.append({"role": "user", "content": content})
@@ -255,6 +334,8 @@ def main():
 
     pending_text: str | None = None
     pending_audio: str | None = None
+    pending_image: str | None = None
+    pending_video: str | None = None
 
     print("OpenRouter CLI Demo")
     print(f"Model: {MODEL}")
@@ -267,12 +348,18 @@ def main():
             print(f"  [text]  {preview}")
         if pending_audio:
             print("  [audio] ready")
+        if pending_image:
+            print(f"  [image] {_media_preview(pending_image)}")
+        if pending_video:
+            print(f"  [video] {_media_preview(pending_video)}")
         print()
         print("  1. Input text")
         if AUDIO_AVAILABLE:
             print("  2. Record audio")
         else:
             print("  2. Record audio  (unavailable — pip install sounddevice soundfile)")
+        print("  4. Attach image (URL or file path)")
+        print("  5. Attach MP4 video (URL or file path)")
         print("  3. Send")
         print("  9. Exit")
 
@@ -295,12 +382,34 @@ def main():
                 pending_audio = audio
 
         elif choice == "3":
-            if not pending_text and not pending_audio:
-                print("Nothing to send. Add text or record audio first.")
+            if not pending_text and not pending_audio and not pending_image and not pending_video:
+                print("Nothing to send. Add text, audio, image, or video first.")
                 continue
-            send(client, pending_text, pending_audio)
+            send(client, pending_text, pending_audio, pending_image, pending_video)
             pending_text = None
             pending_audio = None
+            pending_image = None
+            pending_video = None
+
+        elif choice == "4":
+            image_input = input("Image URL or file path: ").strip()
+            if not image_input:
+                print("No image input.")
+                continue
+            image_value = resolve_image_input(image_input)
+            if image_value:
+                pending_image = image_value
+                print("Image attached.")
+
+        elif choice == "5":
+            video_input = input("MP4 URL or file path: ").strip()
+            if not video_input:
+                print("No video input.")
+                continue
+            video_value = resolve_mp4_input(video_input)
+            if video_value:
+                pending_video = video_value
+                print("Video attached.")
 
         elif choice == "9":
             print("Goodbye!")
