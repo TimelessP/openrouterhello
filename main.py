@@ -8,6 +8,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from typing import Any, cast
 
 from dotenv import load_dotenv
@@ -140,8 +142,66 @@ def _media_preview(value: str) -> str:
     return value if len(value) <= 60 else value[:57] + "..."
 
 
-def record_audio() -> str | None:
-    """Record audio until the user presses Enter. Returns base64-encoded WAV or None."""
+def _audio_format_from_suffix(name: str) -> str | None:
+    suffix = Path(name).suffix.lower()
+    if suffix == ".wav":
+        return "wav"
+    if suffix == ".mp3":
+        return "mp3"
+    return None
+
+
+def _encode_audio_bytes(raw: bytes, audio_format: str, source_name: str) -> dict[str, str]:
+    size_mb = len(raw) / (1024 * 1024)
+    print(f"Loaded {source_name} ({size_mb:.2f} MB) as {audio_format}.")
+    return {
+        "data": base64.b64encode(raw).decode("utf-8"),
+        "format": audio_format,
+    }
+
+
+def resolve_audio_file_input(value: str) -> dict[str, str] | None:
+    if value.startswith(("http://", "https://")):
+        parsed = urlparse(value)
+        audio_format = _audio_format_from_suffix(parsed.path)
+        if not audio_format:
+            print("Audio URL must end with .wav or .mp3")
+            return None
+
+        try:
+            req = Request(value, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=20) as response:
+                raw = response.read()
+        except Exception as e:
+            print(f"Could not download audio URL: {e}")
+            return None
+
+        return _encode_audio_bytes(raw, audio_format, value)
+
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+
+    if not path.exists() or not path.is_file():
+        print(f"File not found: {value}")
+        return None
+
+    audio_format = _audio_format_from_suffix(path.name)
+    if not audio_format:
+        print("Audio file must have .wav or .mp3 extension")
+        return None
+
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        print(f"Could not read file: {e}")
+        return None
+
+    return _encode_audio_bytes(raw, audio_format, path.name)
+
+
+def record_audio() -> dict[str, str] | None:
+    """Record audio until Enter is pressed. Returns base64+format for input_audio."""
     try:
         import sounddevice as sd
         import soundfile as sf
@@ -181,7 +241,10 @@ def record_audio() -> str | None:
 
     duration = len(audio_data) / SAMPLE_RATE
     print(f"Recorded {duration:.1f}s of audio.")
-    return base64.b64encode(wav_bytes).decode("utf-8")
+    return {
+        "data": base64.b64encode(wav_bytes).decode("utf-8"),
+        "format": "wav",
+    }
 
 
 def _execute_tool_call(tool_call: Any) -> dict[str, str]:
@@ -271,7 +334,7 @@ def _respond_with_tools(client: OpenAI, messages: list[dict[str, Any]]) -> str:
 def send(
     client: OpenAI,
     pending_text: str | None,
-    pending_audio: str | None,
+    pending_audio: dict[str, str] | None,
     pending_image: str | None,
     pending_video: str | None,
 ):
@@ -286,7 +349,10 @@ def send(
     if pending_audio:
         content.append({
             "type": "input_audio",
-            "input_audio": {"data": pending_audio, "format": "wav"},
+            "input_audio": {
+                "data": pending_audio["data"],
+                "format": pending_audio["format"],
+            },
         })
     if pending_video:
         content.append({
@@ -333,7 +399,7 @@ def main():
     )
 
     pending_text: str | None = None
-    pending_audio: str | None = None
+    pending_audio: dict[str, str] | None = None
     pending_image: str | None = None
     pending_video: str | None = None
 
@@ -347,7 +413,7 @@ def main():
             preview = pending_text[:60] + ("..." if len(pending_text) > 60 else "")
             print(f"  [text]  {preview}")
         if pending_audio:
-            print("  [audio] ready")
+            print(f"  [audio] ready ({pending_audio['format']})")
         if pending_image:
             print(f"  [image] {_media_preview(pending_image)}")
         if pending_video:
@@ -358,9 +424,10 @@ def main():
             print("  2. Record audio")
         else:
             print("  2. Record audio  (unavailable — pip install sounddevice soundfile)")
+        print("  3. Attach WAV/MP3 file (URL or file path)")
         print("  4. Attach image (URL or file path)")
         print("  5. Attach MP4 video (URL or file path)")
-        print("  3. Send")
+        print("  6. Send")
         print("  9. Exit")
 
         choice = input("\n> ").strip()
@@ -382,14 +449,14 @@ def main():
                 pending_audio = audio
 
         elif choice == "3":
-            if not pending_text and not pending_audio and not pending_image and not pending_video:
-                print("Nothing to send. Add text, audio, image, or video first.")
+            audio_input = input("WAV/MP3 URL or file path: ").strip()
+            if not audio_input:
+                print("No audio input.")
                 continue
-            send(client, pending_text, pending_audio, pending_image, pending_video)
-            pending_text = None
-            pending_audio = None
-            pending_image = None
-            pending_video = None
+            audio_value = resolve_audio_file_input(audio_input)
+            if audio_value:
+                pending_audio = audio_value
+                print(f"Audio attached ({audio_value['format']}).")
 
         elif choice == "4":
             image_input = input("Image URL or file path: ").strip()
@@ -410,6 +477,16 @@ def main():
             if video_value:
                 pending_video = video_value
                 print("Video attached.")
+
+        elif choice == "6":
+            if not pending_text and not pending_audio and not pending_image and not pending_video:
+                print("Nothing to send. Add text, audio, image, or video first.")
+                continue
+            send(client, pending_text, pending_audio, pending_image, pending_video)
+            pending_text = None
+            pending_audio = None
+            pending_image = None
+            pending_video = None
 
         elif choice == "9":
             print("Goodbye!")
