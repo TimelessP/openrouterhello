@@ -1,7 +1,11 @@
 import os
 import sys
 import base64
+import json
 import tempfile
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from dotenv import load_dotenv
@@ -24,7 +28,53 @@ load_dotenv()
 
 SAMPLE_RATE = 44100
 CHANNELS = 1
-MODEL = "openrouter/healer-alpha"
+MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/healer-alpha")
+
+
+def get_current_utc_datetime() -> dict[str, str]:
+    now = datetime.now(timezone.utc)
+    return {
+        "utc_datetime": now.isoformat(),
+        "unix_timestamp": str(int(now.timestamp())),
+    }
+
+
+def generate_uuid4() -> dict[str, str]:
+    return {"uuid4": str(uuid.uuid4())}
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_utc_datetime",
+            "description": "Get the current date and time in UTC.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_uuid4",
+            "description": "Generate a fresh UUIDv4 string.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+TOOL_FUNCTIONS: dict[str, Any] = {
+    "get_current_utc_datetime": get_current_utc_datetime,
+    "generate_uuid4": generate_uuid4,
+}
 
 
 def record_audio() -> str | None:
@@ -71,6 +121,90 @@ def record_audio() -> str | None:
     return base64.b64encode(wav_bytes).decode("utf-8")
 
 
+def _execute_tool_call(tool_call: Any) -> dict[str, str]:
+    tool_name = tool_call.function.name
+    raw_args = tool_call.function.arguments or "{}"
+
+    try:
+        parsed_args = json.loads(raw_args)
+        if not isinstance(parsed_args, dict):
+            parsed_args = {}
+    except json.JSONDecodeError:
+        parsed_args = {}
+
+    tool_fn = TOOL_FUNCTIONS.get(tool_name)
+    if tool_fn is None:
+        result: dict[str, str] = {"error": f"Unknown tool: {tool_name}"}
+    else:
+        try:
+            result = tool_fn(**parsed_args)
+        except TypeError as e:
+            result = {"error": f"Invalid args for {tool_name}: {e}"}
+        except Exception as e:
+            result = {"error": f"Tool failed ({tool_name}): {e}"}
+
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_name,
+        "content": json.dumps(result),
+    }
+
+
+def _respond_with_tools(client: OpenAI, messages: list[dict[str, Any]]) -> str:
+    max_rounds = 4
+
+    for _ in range(max_rounds):
+        completion = client.chat.completions.create(
+            extra_headers={
+                "HTTP-Referer": "https://localhost",
+                "X-OpenRouter-Title": "CLI Demo",
+            },
+            extra_body={},
+            model=MODEL,
+            messages=cast(Any, messages),
+            tools=cast(Any, TOOLS),
+            tool_choice="auto",
+            parallel_tool_calls=True,
+        )
+
+        message = completion.choices[0].message
+        message_dict = cast(dict[str, Any], message.model_dump(exclude_none=True))
+        messages.append(message_dict)
+
+        tool_calls = message.tool_calls
+        if not tool_calls:
+            return message.content or ""
+
+        print("\n--- Tool calls ---")
+        for tool_call in tool_calls:
+            tool_call_any = cast(Any, tool_call)
+            raw_args = tool_call_any.function.arguments or "{}"
+            print(f"[tool/request] {tool_call_any.function.name} args={raw_args}")
+
+        tool_results: list[dict[str, str]] = [
+            {"role": "tool", "tool_call_id": "", "name": "", "content": ""}
+            for _ in tool_calls
+        ]
+
+        with ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
+            future_to_index = {
+                executor.submit(_execute_tool_call, tool_call): idx
+                for idx, tool_call in enumerate(tool_calls)
+            }
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                tool_result = future.result()
+                tool_results[idx] = tool_result
+                print(f"[tool/result] {tool_result['name']} -> {tool_result['content']}")
+
+        print("------------------")
+
+        messages.extend(tool_results)
+
+    return "I reached the tool-call round limit before producing a final answer."
+
+
 def send(client: OpenAI, pending_text: str | None, pending_audio: str | None):
     content: list[dict[str, Any]] = []
     if pending_text:
@@ -81,25 +215,28 @@ def send(client: OpenAI, pending_text: str | None, pending_audio: str | None):
             "input_audio": {"data": pending_audio, "format": "wav"},
         })
 
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "You can call tools when useful. "
+                "Use get_current_utc_datetime for current UTC date/time and "
+                "generate_uuid4 for a fresh UUID."
+            ),
+        }
+    ]
+
     # Use simple string for text-only (broader model compatibility)
     if pending_text and not pending_audio:
-        messages = [{"role": "user", "content": pending_text}]
+        messages.append({"role": "user", "content": pending_text})
     else:
-        messages = [{"role": "user", "content": content}]
+        messages.append({"role": "user", "content": content})
 
     print("\nSending to OpenRouter...")
     try:
-        completion = client.chat.completions.create(
-            extra_headers={
-                "HTTP-Referer": "https://localhost",
-                "X-OpenRouter-Title": "CLI Demo",
-            },
-            extra_body={},
-            model=MODEL,
-            messages=cast(Any, messages),
-        )
+        final_text = _respond_with_tools(client, messages)
         print("\n--- Response ---")
-        print(completion.choices[0].message.content)
+        print(final_text)
         print("----------------")
     except Exception as e:
         print(f"\nAPI error: {e}")
